@@ -152,7 +152,7 @@ export default function App() {
       },
 
       onTrace: (info) => {
-        gotFirstEventRef.current = true;                      // ⭐ 收到首事件
+        gotFirstEventRef.current = true;                      // 收到首事件
         debugMode && console.log('[SSE][trace]', info);
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
         setThinking((prev) => [...prev, `[trace] ${JSON.stringify(info)}`]);
@@ -196,7 +196,7 @@ export default function App() {
     return () => {
       try { sseRef.current?.close?.(); } catch(e) { console.error('Failed to close SSE on unmount:', e); }
       guardRef.current.clear();
-      gotFirstEventRef.current = false; // ⭐ 清理
+      gotFirstEventRef.current = false; // 清理
       try { const eruda = (window.eruda && (window.eruda.default || window.eruda)); eruda && eruda.destroy && eruda.destroy(); } catch (e) { console.error('Failed to destroy eruda:', e); }
     };
   }, []);
@@ -230,7 +230,7 @@ export default function App() {
     setThinking([]);
     activeStreamKeyRef.current = genId;
     hasStreamBubbleRef.current = false;
-    gotFirstEventRef.current = false; // ⭐ 新一轮，重置“首事件”标记
+    gotFirstEventRef.current = false; //  新一轮，重置“首事件”标记
     setStreamTextMap((prev) => { const n = { ...prev }; delete n[genId]; return n; });
 
     // —— 每轮新建 SSE —— //

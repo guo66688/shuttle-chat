@@ -22,6 +22,7 @@ export function sendToSSEWebhook(msg, sender = 'demo_user', genId, extraMeta = {
     `${BASE}/webhooks/sse/webhook`,
     {
       sender,
+      gen_id: genId,
       text: msg, // 自定义通道是 text 字段
       metadata: { gen_id: genId, ...extraMeta }, // 服务端会透传 gen_id/generation_id
     },

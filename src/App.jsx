@@ -1,4 +1,3 @@
-// path: src/App.jsx
 import React, { useState, useRef, useEffect } from 'react';
 import Chat, { Bubble, Avatar, useMessages } from '@chatui/core';
 import '@chatui/core/dist/index.css';
@@ -15,10 +14,6 @@ async function initEruda() {
     const eruda = mod?.default || mod;
     if (!eruda._isInit) {
       eruda.init({ tool: ['console','elements','resources','network','info'], defaults: { displaySize: 50, transparency: 0.95 } });
-      // try {
-      //   const n = await import('eruda-network');
-      //   eruda.add(n.default || n);
-      // } catch(e) {console.warn('Failed to load eruda-network:', e);}
     }
     console.log('%c[DEBUG] eruda inited', 'color:#0a0');
   } catch (e) {
@@ -73,7 +68,6 @@ function makeGuard() {
   };
 }
 
-
 export default function App() {
   const { messages, appendMsg } = useMessages([]);
   const [inputVal, setInputVal] = useState('');
@@ -90,23 +84,40 @@ export default function App() {
   const gotFirstEventRef = useRef(false);
   const [debugMode, setDebugMode] = useState(initDebugFromEnv);
   
+  const lastTokenAtRef = useRef(0);
+  const quietTimerRef = useRef(null);
+  const QUIET_MS = 10000; // 10s 无 token 且收到 ping -> 认为已完成（仅收尾，不落盘）
 
+  function kickQuietTimer() {
+    if (quietTimerRef.current) clearTimeout(quietTimerRef.current);
+    quietTimerRef.current = setTimeout(() => {
+      // 只要这一轮确实收过事件且仍处于发送中，就静默收尾（不落盘）
+      if (gotFirstEventRef.current && sending) {
+        debugMode && console.log('[QUIET-FINALIZE] quiet window reached');
+        hasStreamBubbleRef.current = false;
+        finalizeStreamDueTo('quiet finalize');
+        guardRef.current.clear();
+      }
+    }, QUIET_MS);
+  }
 
   function createSSEClient(genId) {
     const client = new RasaSSEClient({
       senderId: SESSION_SENDER,
 
       onUserEcho: (line) => {
-        gotFirstEventRef.current = true;                      // ⭐ 收到首事件
+        gotFirstEventRef.current = true;                      //  收到首事件
         debugMode && console.log('[SSE][message]', line);
         setThinking((prev) => [...prev, `> ${line}`]);
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
       },
 
       onToken: (piece) => {
-        gotFirstEventRef.current = true;                      // ⭐ 收到首事件
+        gotFirstEventRef.current = true;                      //  收到首事件
         debugMode && console.log('[SSE][token]', piece);
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
+        lastTokenAtRef.current = Date.now();
+        kickQuietTimer();   // 静默窗口计时，仅用于收尾，不负责落盘
 
         const key = activeStreamKeyRef.current;
         if (!key || key !== genId) return;
@@ -125,7 +136,7 @@ export default function App() {
       },
 
       onBotMessage: (payload) => {
-        gotFirstEventRef.current = true;                      // ⭐ 收到首事件
+        gotFirstEventRef.current = true;                      //  收到首事件
         debugMode && console.log('[SSE][bot]', payload);
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
 
@@ -139,7 +150,7 @@ export default function App() {
         }
         if (hasStreamBubbleRef.current && activeStreamKeyRef.current === genId && payload?.text) {
           setStreamTextMap((prev) => ({ ...prev, [genId]: payload.text }));
-          hasStreamBubbleRef.current = false;
+          hasStreamBubbleRef.current = false; // 本轮已由最终 text 结束
           return;
         }
         if (payload?.text) {
@@ -157,11 +168,25 @@ export default function App() {
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
         setThinking((prev) => [...prev, `[trace] ${JSON.stringify(info)}`]);
       },
-
+      onPing: () => {
+        const now = Date.now();
+        // 若已出现“静默窗口”，立刻触发静默收尾计时器（很短）
+        if (lastTokenAtRef.current && now - lastTokenAtRef.current >= QUIET_MS) {
+          debugMode && console.log('[SSE][ping->quiet-check]');
+          kickQuietTimer();
+        }
+      },
       onDone: () => {
         debugMode && console.log('[SSE][done]');
         guardRef.current.clear();
-        finalizeStreamDueTo('done event');
+        // 仅收尾，不落盘；展示内容完全依赖 token 累计或最终 text
+        try {
+          finalizeStreamDueTo('done event');
+        } catch (e) {
+          console.error('finalize failed, force unlock:', e);
+          setSending(false);
+          hasStreamBubbleRef.current = false;
+        }
       },
 
       onError: (err) => {
@@ -178,6 +203,7 @@ export default function App() {
   function finalizeStreamDueTo(reason) {
     debugMode && console.log('[FINALIZE]', reason);
     try { sseRef.current?.close?.(); } catch(e) { console.error('Failed to close SSE:', e); }
+    if (quietTimerRef.current) { clearTimeout(quietTimerRef.current); quietTimerRef.current = null; }
     sseRef.current = null;
     hasStreamBubbleRef.current = false;
     setSending(false);
@@ -196,6 +222,7 @@ export default function App() {
     return () => {
       try { sseRef.current?.close?.(); } catch(e) { console.error('Failed to close SSE on unmount:', e); }
       guardRef.current.clear();
+      if (quietTimerRef.current) { clearTimeout(quietTimerRef.current); quietTimerRef.current = null; } 
       gotFirstEventRef.current = false; // 清理
       try { const eruda = (window.eruda && (window.eruda.default || window.eruda)); eruda && eruda.destroy && eruda.destroy(); } catch (e) { console.error('Failed to destroy eruda:', e); }
     };
@@ -217,9 +244,14 @@ export default function App() {
   }, [debugMode]);
 
   // ----------- 发送消息 -----------
-  async function handleSendMsg(text) {
+ async function handleSendMsg(text) {
     const content = text?.trim();
-    if (!content || sending) return;
+    if (!content) return;
+    // 🚫 单飞锁：上一轮未收尾时忽略重复发送
+    if (sending) {
+      debugMode && console.log('[GUARD] ignore duplicate send');
+      return;
+    }
     setSending(true);
     lastUserTextRef.current = content;
 
@@ -257,6 +289,7 @@ export default function App() {
       setSending(false);
     }
   }
+
   const renderMessageContent = (msg) => {
     const isUser = msg.position === 'right';
 
@@ -292,14 +325,26 @@ export default function App() {
     <Avatar size="small" src={msg.position === 'left' ? botAvatar : userAvatar} style={{ margin: '0 8px' }} />
   );
 
-  const onSendClick = () => handleSendMsg(inputVal);
+  const onSendClick = () => {
+    if (sending) {
+      debugMode && console.log('[GUARD] click ignored while sending');
+      return;
+    }
+    handleSendMsg(inputVal);
+  };
   const onKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !sending) {
       e.preventDefault();
       handleSendMsg(inputVal);
     }
   };
-  const handleQuickReply = (q) => handleSendMsg(q);
+  const handleQuickReply = (q) => {
+    if (sending) {
+      debugMode && console.log('[GUARD] quick-reply ignored while sending');
+      return;
+    }
+    handleSendMsg(q);
+  };
 
   // ---------------- UI（已移除左侧侧边栏，聊天区域全宽） ----------------
   return (
@@ -386,7 +431,8 @@ export default function App() {
                     fontSize: 12,
                     color: '#333',
                     marginRight: 8,
-                    cursor: 'pointer',
+                    cursor: sending ? 'not-allowed' : 'pointer',
+                    opacity: sending ? 0.5 : 1,
                     userSelect: 'none',
                   }}
                 >
@@ -416,16 +462,19 @@ export default function App() {
               <button
                 type="button"
                 onClick={onSendClick}
+                disabled={sending}            // 🚫 单飞锁：按钮禁用
+                aria-disabled={sending}
+                title={sending ? '正在发送中，请稍候...' : '发送'}
                 style={{
                   width: 36,
                   height: 36,
                   borderRadius: '50%',
-                  background: '#6C1FBF',
+                  background: sending ? '#999' : '#6C1FBF',
                   border: 'none',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  cursor: 'pointer',
+                  cursor: sending ? 'not-allowed' : 'pointer',
                 }}
               >
                 <SendOutlined style={{ color: '#FFF', fontSize: 18 }} />

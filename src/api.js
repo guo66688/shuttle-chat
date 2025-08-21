@@ -3,8 +3,9 @@
 // 说明：事件名不匹配问题主要出在 SSE 客户端，这里仅保持参数与服务端一致。
 
 import axios from 'axios';
-
-const BASE = 'http://192.168.18.13:5005';
+const ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '';
+const ENV_BASE = (typeof window !== 'undefined' && import.meta.env && (import.meta.env.VITE_RASA_BASE || import.meta.env.REACT_APP_RASA_BASE)) || '';
+const BASE = (ENV_BASE || ORIGIN || 'http://192.168.18.13:5005');
 
 // Rasa RESTInput（默认通道）：非流式
 export function sendToRasa(msg, sender = 'demo_user', genId, extraMeta = {}) {

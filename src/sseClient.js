@@ -4,7 +4,9 @@
 // - 统一监听服务端实际会发的事件名：token / trace / done / text / image / attachment / custom
 // - 支持通过 URL 参数传递 reconnect_ms（即使后端未读取，也不影响功能）
 
-const BASE = 'http://192.168.18.13:5005';     // Rasa 服务地址
+const ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '';
+const ENV_BASE = (typeof window !== 'undefined' && window.env && (window.env.RASA_BASE || window.env.REACT_APP_RASA_BASE)) || '';
+const BASE = (ENV_BASE || ORIGIN || 'http://192.168.18.13:5005');  // 三选一：环境变量 > 同源 > 兜底IP
 const SSE_PATH = '/webhooks/sse/stream';      // SSE 订阅端点（GET）
 
 // function makeCid() {
@@ -21,6 +23,7 @@ export class RasaSSEClient {
     onToken,
     onDone,
     onError,
+    onPing,
   }) {
     this.senderId = senderId;
     this.onUserEcho = onUserEcho;
@@ -29,7 +32,7 @@ export class RasaSSEClient {
     this.onToken = onToken;
     this.onDone = onDone;
     this.onError = onError;
-
+    this.onPing = onPing;
     this.es = null;
     this.cid = null;
     this._opened = false;
@@ -46,18 +49,27 @@ export class RasaSSEClient {
       url.searchParams.set('reconnect_ms', String(reconnectMs));
 
       this.es = new EventSource(url.toString());
+      console.log('[SSE] connecting to', url.toString());
 
       this.es.onopen = () => {
         this._opened = true;
+        // 0: CONNECTING, 1: OPEN, 2: CLOSED
+        console.log('[SSE] onopen readyState=', this.es?.readyState);
         resolve();
       };
 
       this.es.onerror = (err) => {
+        // 某些代理中断也会触发这里
+        console.warn('[SSE] onerror readyState=', this.es?.readyState, err);
         if (!this._opened) reject(err instanceof Error ? err : new Error('SSE failed to open'));
         this.onError?.(err);
       };
 
-      this.es.onmessage = (e) => this.onUserEcho?.(e.data);
+      this.es.onmessage = (e) => {
+        // 默认事件（无 event:），一般不用，但打印以便排查
+        console.log('[SSE] (message)', e?.data?.slice?.(0, 120));
+        this.onUserEcho?.(e.data);
+      };
 
       this.es.addEventListener('token', (e) => {
         try {
@@ -73,7 +85,28 @@ export class RasaSSEClient {
         catch (err) { console.error('SSE trace 解析失败', err); }
       });
 
-      this.es.addEventListener('done', () => this.onDone?.());
+      // 忽略重复 done，避免 UI 二次收尾
+      let _doneFired = false;
+      this.es.addEventListener('done', (e) => {
+        if (_doneFired) {
+          console.log('[SSE] duplicate done ignored');
+          return;
+        }
+        _doneFired = true;
+        console.log('[SSE] done', e?.data);
+        this.onDone?.();
+      });
+
+      // 可视化心跳，确认前端确实能收到首帧后的 keep-alive
+      this.es.addEventListener('ping', (e) => {
+        console.log('[SSE] ping', e?.data);
+        try {
+          const payload = e?.data ? JSON.parse(e.data) : {};
+          this.onPing?.(payload);
+        } catch {
+          this.onPing?.({});
+        }
+      });
 
       for (const ev of ['text', 'image', 'attachment', 'custom']) {
         this.es.addEventListener(ev, (e) => {

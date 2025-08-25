@@ -5,8 +5,8 @@
 // - 支持通过 URL 参数传递 reconnect_ms（即使后端未读取，也不影响功能）
 
 const ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '';
-const ENV_BASE = (typeof window !== 'undefined' && window.env && (window.env.RASA_BASE || window.env.REACT_APP_RASA_BASE)) || '';
-const BASE = (ENV_BASE || ORIGIN || 'http://192.168.18.13:5005');  // 三选一：环境变量 > 同源 > 兜底IP
+// 同源反代：固定走 /api 前缀（由 Nginx 反代到 Rasa）
+const BASE = ORIGIN + '/api';
 const SSE_PATH = '/webhooks/sse/stream';      // SSE 订阅端点（GET）
 
 // function makeCid() {

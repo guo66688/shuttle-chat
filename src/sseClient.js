@@ -4,10 +4,15 @@
 // - 统一监听服务端实际会发的事件名：token / trace / done / text / image / attachment / custom
 // - 支持通过 URL 参数传递 reconnect_ms（即使后端未读取，也不影响功能）
 
+// dev 模式下走固定地址，否则走同源 /api
+const DEV = import.meta.env?.DEV;   // Vite 下有这个变量
 const ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '';
-// 同源反代：固定走 /api 前缀（由 Nginx 反代到 Rasa）
-const BASE = ORIGIN + '/api';
-const SSE_PATH = '/webhooks/sse/stream';      // SSE 订阅端点（GET）
+
+const BASE = DEV
+  ? "http://127.0.0.1:5005"   // ← 本地 Rasa SSE 服务地址
+  : ORIGIN + "/api";
+
+const SSE_PATH = "/webhooks/sse/stream";   // SSE 订阅端点（GET）
 
 // function makeCid() {
 //   try { return crypto?.randomUUID?.() } catch (e) { console.error('Failed to generate CID:', e); }  

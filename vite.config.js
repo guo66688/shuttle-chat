@@ -9,7 +9,7 @@
      proxy: {
        // 其他 /webhooks 路由按需保留，这里单独把 SSE 路由特殊对待
        '/webhooks/sse/stream': {
-         target: 'http://192.168.18.13:5005',
+         target: 'http://192.168.18.25:5005',
          changeOrigin: true,
          ws: false,            // SSE 不是 WebSocket
          secure: false,
@@ -39,7 +39,7 @@
       },
       // 其他 REST 路由（可选）
        '/webhooks': {
-         target: 'http://192.168.18.13:5005',
+         target: 'http://192.168.18.25:5005',
          changeOrigin: true,
          secure: false,
          ws: false,

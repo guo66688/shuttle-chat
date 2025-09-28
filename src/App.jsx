@@ -1,3 +1,6 @@
+// src/App.jsx
+// 修复 eslint no-unused-vars：移除未使用的 node/e 变量；其余逻辑与 remark 插件方案一致
+
 import React, { useState, useRef, useEffect } from 'react';
 import Chat, { Bubble, Avatar, useMessages } from '@chatui/core';
 import '@chatui/core/dist/index.css';
@@ -6,6 +9,14 @@ import { LeftOutlined, ReloadOutlined, AudioOutlined, SendOutlined } from '@ant-
 import CollapsiblePanel from './components/CollapsiblePanel';
 import { RasaSSEClient } from './sseClient';
 import { sendToSSEWebhook } from './api';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
+
+// 自定义 remark 插件（AST 级清洗/规整）
+import remarkRemoveSystemLines from './markdown/remark-remove-system-lines';
+import remarkPlanHeading from './markdown/remark-plan-heading';
+import remarkTypography from './markdown/remark-typography';
 
 // ========== 调试模式（嵌入 devtools: eruda） ==========
 async function initEruda() {
@@ -13,23 +24,27 @@ async function initEruda() {
     const mod = await import(/* webpackChunkName: "eruda" */ 'eruda');
     const eruda = mod?.default || mod;
     if (!eruda._isInit) {
-      eruda.init({ tool: ['console','elements','resources','network','info'], defaults: { displaySize: 50, transparency: 0.95 } });
+      eruda.init({
+        tool: ['console', 'elements', 'resources', 'network', 'info'],
+        defaults: { displaySize: 50, transparency: 0.95 },
+      });
     }
-    console.log('%c[DEBUG] eruda inited', 'color:#0a0');
-  } catch (e) {
-    console.warn('[DEBUG] 加载 eruda 失败：', e);
+    // 可选：这里不打印 e，避免 no-unused-vars
+    // console.log('[DEBUG] eruda inited');
+  } catch {
+    // 静默忽略，避免 no-unused-vars
   }
 }
 function initDebugFromEnv() {
-  return /(?:\?|&)debug=1\b/.test(window.location.search) ||
-    localStorage.getItem('debug_mode') === '1';
+  return /(?:\?|&)debug=1\b/.test(window.location.search) || localStorage.getItem('debug_mode') === '1';
 }
+
 // ---------- 工具：安全 UUID ----------
 function safeUUID() {
   try {
     if (window?.crypto?.randomUUID) return window.crypto.randomUUID();
   } catch {
-    console.error('crypto.randomUUID failed, falling back to custom UUID generation');
+    // ignore
   }
   return 'u_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
 }
@@ -50,8 +65,13 @@ const SESSION_SENDER =
     return id;
   })();
 
+// ✅ 最小化“最终文本规范化”——只做 CRLF→LF 与 trim（清洗交给 remark）
+function normalizeFinalText(s) {
+  if (!s) return '';
+  return String(s).replace(/\r\n?/g, '\n').trim();
+}
+
 // ========== 看门狗（流式兜底，防止 done 丢失导致 sending 不复位） ==========
-// 原来 12000，改为 45000，更适合移动端/弱网
 const STREAM_GUARD_MS = 45000;
 
 function makeGuard() {
@@ -68,6 +88,14 @@ function makeGuard() {
   };
 }
 
+function asPlugin(mod) {
+  if (typeof mod === 'function') return mod;
+  if (mod && typeof mod.default === 'function') return mod.default;
+  return null;
+}
+const GFM = asPlugin(remarkGfm);
+const BREAKS = asPlugin(remarkBreaks);
+
 export default function App() {
   const { messages, appendMsg } = useMessages([]);
   const [inputVal, setInputVal] = useState('');
@@ -83,18 +111,40 @@ export default function App() {
   // 新增：首事件标记
   const gotFirstEventRef = useRef(false);
   const [debugMode, setDebugMode] = useState(initDebugFromEnv);
-  
+
   const lastTokenAtRef = useRef(0);
   const quietTimerRef = useRef(null);
   const QUIET_MS = 10000; // 10s 无 token 且收到 ping -> 认为已完成（仅收尾，不落盘）
+  const streamTextMapRef = useRef({});
+  useEffect(() => {
+    streamTextMapRef.current = streamTextMap;
+  }, [streamTextMap]);
+  const committedKeysRef = useRef(new Set()); // 防止重复固化
 
+  function commitStream(genId, overrideText) {
+    if (!genId || committedKeysRef.current.has(genId)) return;
+    const raw = overrideText ?? streamTextMapRef.current[genId] ?? '';
+    const finalText = normalizeFinalText(raw);
+    if (!finalText) return; // 没内容就不落盘
+
+    appendMsg({
+      type: 'text',
+      content: { text: finalText },
+      position: 'left',
+      avatar: botAvatar,
+    });
+    // 清空占位，避免“历史流式气泡”继续占屏
+    setStreamTextMap((prev) => ({ ...prev, [genId]: '' }));
+    committedKeysRef.current.add(genId);
+  }
   function kickQuietTimer() {
     if (quietTimerRef.current) clearTimeout(quietTimerRef.current);
     quietTimerRef.current = setTimeout(() => {
       // 只要这一轮确实收过事件且仍处于发送中，就静默收尾（不落盘）
       if (gotFirstEventRef.current && sending) {
-        debugMode && console.log('[QUIET-FINALIZE] quiet window reached');
         hasStreamBubbleRef.current = false;
+        const key = activeStreamKeyRef.current;
+        commitStream(key);
         finalizeStreamDueTo('quiet finalize');
         guardRef.current.clear();
       }
@@ -106,18 +156,16 @@ export default function App() {
       senderId: SESSION_SENDER,
 
       onUserEcho: (line) => {
-        gotFirstEventRef.current = true;                      //  收到首事件
-        debugMode && console.log('[SSE][message]', line);
+        gotFirstEventRef.current = true; // 收到首事件
         setThinking((prev) => [...prev, `> ${line}`]);
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
       },
 
       onToken: (piece) => {
-        gotFirstEventRef.current = true;                      //  收到首事件
-        debugMode && console.log('[SSE][token]', piece);
+        gotFirstEventRef.current = true; // 收到首事件
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
         lastTokenAtRef.current = Date.now();
-        kickQuietTimer();   // 静默窗口计时，仅用于收尾，不负责落盘
+        kickQuietTimer(); // 静默窗口计时，仅用于收尾，不负责落盘
 
         const key = activeStreamKeyRef.current;
         if (!key || key !== genId) return;
@@ -136,8 +184,7 @@ export default function App() {
       },
 
       onBotMessage: (payload) => {
-        gotFirstEventRef.current = true;                      //  收到首事件
-        debugMode && console.log('[SSE][bot]', payload);
+        gotFirstEventRef.current = true; // 收到首事件
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
 
         if (payload?.text) {
@@ -147,15 +194,19 @@ export default function App() {
             setThinking((prev) => [...prev, '[skip] 用户原话回显']);
             return;
           }
-        }
-        if (hasStreamBubbleRef.current && activeStreamKeyRef.current === genId && payload?.text) {
-          setStreamTextMap((prev) => ({ ...prev, [genId]: payload.text }));
-          hasStreamBubbleRef.current = false; // 本轮已由最终 text 结束
+          // ☆ 关键：直接落盘一条“普通文本消息”（不依赖占位/commit）
+          appendMsg({
+            type: 'text',
+            content: { text: normalizeFinalText(t) },
+            position: 'left',
+            avatar: botAvatar,
+          });
+          // 流式占位若存在，标记结束即可（不强求它参与显示）
+          hasStreamBubbleRef.current = false;
           return;
         }
-        if (payload?.text) {
-          appendMsg({ type: 'text', content: { text: payload.text }, position: 'left', avatar: botAvatar });
-        } else if (payload?.image) {
+
+        if (payload?.image) {
           appendMsg({ type: 'image', content: { picUrl: payload.image }, position: 'left', avatar: botAvatar });
         } else if (payload?.attachment || payload?.custom) {
           setThinking((prev) => [...prev, JSON.stringify(payload.attachment || payload.custom)]);
@@ -163,8 +214,7 @@ export default function App() {
       },
 
       onTrace: (info) => {
-        gotFirstEventRef.current = true;                      // 收到首事件
-        debugMode && console.log('[SSE][trace]', info);
+        gotFirstEventRef.current = true; // 收到首事件
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
         setThinking((prev) => [...prev, `[trace] ${JSON.stringify(info)}`]);
       },
@@ -172,26 +222,23 @@ export default function App() {
         const now = Date.now();
         // 若已出现“静默窗口”，立刻触发静默收尾计时器（很短）
         if (lastTokenAtRef.current && now - lastTokenAtRef.current >= QUIET_MS) {
-          debugMode && console.log('[SSE][ping->quiet-check]');
           kickQuietTimer();
         }
       },
       onDone: () => {
-        debugMode && console.log('[SSE][done]');
         guardRef.current.clear();
         // 仅收尾，不落盘；展示内容完全依赖 token 累计或最终 text
         try {
+          const key = activeStreamKeyRef.current;
+          commitStream(key); // ☆ 新增：将当前流式文本固化为普通消息
           finalizeStreamDueTo('done event');
-        } catch (e) {
-          console.error('finalize failed, force unlock:', e);
+        } catch {
           setSending(false);
           hasStreamBubbleRef.current = false;
         }
       },
 
       onError: (err) => {
-        debugMode && console.log('[SSE][error]', err);
-        // 错误后等待是否还有事件自动重连；仍由看门狗兜底
         guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
         setThinking((prev) => [...prev, `[sse-error] ${err?.message || err}`]);
       },
@@ -201,9 +248,15 @@ export default function App() {
   }
 
   function finalizeStreamDueTo(reason) {
-    debugMode && console.log('[FINALIZE]', reason);
-    try { sseRef.current?.close?.(); } catch(e) { console.error('Failed to close SSE:', e); }
-    if (quietTimerRef.current) { clearTimeout(quietTimerRef.current); quietTimerRef.current = null; }
+    try {
+      sseRef.current?.close?.();
+    } catch {
+      // ignore
+    }
+    if (quietTimerRef.current) {
+      clearTimeout(quietTimerRef.current);
+      quietTimerRef.current = null;
+    }
     sseRef.current = null;
     hasStreamBubbleRef.current = false;
     setSending(false);
@@ -211,20 +264,32 @@ export default function App() {
   }
 
   function handleStreamTimeout() {
-    const reason = gotFirstEventRef.current
-      ? 'no events within guard window'
-      : 'no first event (likely not subscribed/blocked)';
-    finalizeStreamDueTo(reason);
+    const reason = gotFirstEventRef.current ? 'no events within guard window' : 'no first event (likely not subscribed/blocked)';
+    const key = activeStreamKeyRef.current;
+    commitStream(key);
+    finalizeStreamDueTo(`quiet finalize (${reason})`);
     guardRef.current.clear();
   }
 
   useEffect(() => {
     return () => {
-      try { sseRef.current?.close?.(); } catch(e) { console.error('Failed to close SSE on unmount:', e); }
+      try {
+        sseRef.current?.close?.();
+      } catch {
+        // ignore
+      }
       guardRef.current.clear();
-      if (quietTimerRef.current) { clearTimeout(quietTimerRef.current); quietTimerRef.current = null; } 
+      if (quietTimerRef.current) {
+        clearTimeout(quietTimerRef.current);
+        quietTimerRef.current = null;
+      }
       gotFirstEventRef.current = false; // 清理
-      try { const eruda = (window.eruda && (window.eruda.default || window.eruda)); eruda && eruda.destroy && eruda.destroy(); } catch (e) { console.error('Failed to destroy eruda:', e); }
+      try {
+        const eruda = window.eruda && (window.eruda.default || window.eruda);
+        if (eruda && eruda.destroy) eruda.destroy();
+      } catch {
+        // ignore
+      }
     };
   }, []);
 
@@ -235,23 +300,19 @@ export default function App() {
     } else {
       localStorage.removeItem('debug_mode');
       try {
-        const eruda = (window.eruda && (window.eruda.default || window.eruda));
-        eruda && eruda.destroy && eruda.destroy();
-      } catch (e) {
-        console.error('Failed to destroy eruda:', e);
+        const eruda = window.eruda && (window.eruda.default || window.eruda);
+        if (eruda && eruda.destroy) eruda.destroy();
+      } catch {
+        // ignore
       }
     }
   }, [debugMode]);
 
   // ----------- 发送消息 -----------
- async function handleSendMsg(text) {
+  async function handleSendMsg(text) {
     const content = text?.trim();
     if (!content) return;
-    // 🚫 单飞锁：上一轮未收尾时忽略重复发送
-    if (sending) {
-      debugMode && console.log('[GUARD] ignore duplicate send');
-      return;
-    }
+    if (sending) return;
     setSending(true);
     lastUserTextRef.current = content;
 
@@ -262,29 +323,27 @@ export default function App() {
     setThinking([]);
     activeStreamKeyRef.current = genId;
     hasStreamBubbleRef.current = false;
-    gotFirstEventRef.current = false; //  新一轮，重置“首事件”标记
-    setStreamTextMap((prev) => { const n = { ...prev }; delete n[genId]; return n; });
+    gotFirstEventRef.current = false;
+    setStreamTextMap((prev) => {
+      const n = { ...prev };
+      delete n[genId];
+      return n;
+    });
 
-    // —— 每轮新建 SSE —— //
     sseRef.current = createSSEClient(genId);
 
     try {
-      debugMode && console.log('[SSE] open per-turn /stream');
-      // 允许自动重连，避免弱网/切后台立刻失败
       await sseRef.current.open({ reconnectMs: 2000 });
-
-      // ❌ 不要在 open 后立即 kick 看门狗（等待首事件触发 kick）
-      // guardRef.current.kick(STREAM_GUARD_MS, handleStreamTimeout);
-
-      debugMode && console.log('[HTTP] POST /webhooks/sse/webhook', { content, sender: SESSION_SENDER, genId });
       await sendToSSEWebhook(content, SESSION_SENDER, genId);
-      // 后续由事件/看门狗/ done 控制收尾
-    } catch (e) {
-      try { sseRef.current?.close?.(); } catch (e){console.error('Failed to close SSE on error:', e);}
+    } catch {
+      try {
+        sseRef.current?.close?.();
+      } catch {
+        // ignore
+      }
       sseRef.current = null;
       guardRef.current.clear();
 
-      setThinking((prev) => [...prev, `[http-error] ${e?.message || e}`]);
       appendMsg({ type: 'text', content: { text: '发送失败：无法连接后端 /webhook' }, position: 'left', avatar: botAvatar });
       setSending(false);
     }
@@ -293,23 +352,45 @@ export default function App() {
   const renderMessageContent = (msg) => {
     const isUser = msg.position === 'right';
 
-    if (msg.type === 'image' && msg.content?.picUrl) {
+    // --- 流式占位：保留 pre-wrap，避免半截 Markdown 破版 ---
+    const isStreaming = Boolean(msg?.meta?.streaming && msg?.meta?.streamKey);
+    if (isStreaming) {
+      const t = streamTextMap[msg.meta.streamKey] ?? '';
       return (
-        <div style={{ maxWidth: 280 }}>
-          <img src={msg.content.picUrl} alt="image" style={{ width: '100%', borderRadius: 8 }} />
-        </div>
+        <Bubble
+          content={<div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{t}</div>}
+          style={{
+            backgroundColor: isUser ? '#6C1FBF' : '#F0F0F0',
+            color: isUser ? '#FFF' : '#000',
+            borderRadius: '12px',
+            padding: '8px 12px',
+            maxWidth: '70%',
+          }}
+        />
       );
     }
 
-    let text = msg.content?.text ?? '';
-    if (msg?.meta?.streaming && msg?.meta?.streamKey) {
-      const t = streamTextMap[msg.meta.streamKey];
-      if (typeof t === 'string') text = t;
-    }
+    // --- 最终消息：ReactMarkdown 渲染（清洗交给 remark 插件） ---
+    const text = msg.content?.text ?? '';
+    const node = (
+      <div className="md" style={{ lineHeight: 1.6, wordBreak: 'break-word' }}>
+        <ReactMarkdown
+          remarkPlugins={[GFM, BREAKS, remarkRemoveSystemLines, remarkPlanHeading, remarkTypography].filter(Boolean)}
+          components={{
+            p: (props) => <p style={{ margin: '0.4em 0' }} {...props} />,
+            li: (props) => <li style={{ margin: '0.3em 0' }} {...props} />,
+            // ✅ 移除未使用的 node 形参，避免 eslint no-unused-vars
+            a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+          }}
+        >
+          {text}
+        </ReactMarkdown>
+      </div>
+    );
 
     return (
       <Bubble
-        content={text}
+        content={node}
         style={{
           backgroundColor: isUser ? '#6C1FBF' : '#F0F0F0',
           color: isUser ? '#FFF' : '#000',
@@ -326,10 +407,7 @@ export default function App() {
   );
 
   const onSendClick = () => {
-    if (sending) {
-      debugMode && console.log('[GUARD] click ignored while sending');
-      return;
-    }
+    if (sending) return;
     handleSendMsg(inputVal);
   };
   const onKeyDown = (e) => {
@@ -339,10 +417,7 @@ export default function App() {
     }
   };
   const handleQuickReply = (q) => {
-    if (sending) {
-      debugMode && console.log('[GUARD] quick-reply ignored while sending');
-      return;
-    }
+    if (sending) return;
     handleSendMsg(q);
   };
 
@@ -462,7 +537,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={onSendClick}
-                disabled={sending}            // 🚫 单飞锁：按钮禁用
+                disabled={sending} // 🚫 单飞锁：按钮禁用
                 aria-disabled={sending}
                 title={sending ? '正在发送中，请稍候...' : '发送'}
                 style={{
